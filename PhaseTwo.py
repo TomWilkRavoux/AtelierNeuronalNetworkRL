@@ -495,29 +495,81 @@ def _(
 @app.cell
 def _(mo):
     mo.md(r"""
+    ### Pourquoi l'écart aléatoire/temporel est-il quasi nul ici ?
+
+    Sur **mes** données : split aléatoire RMSE = 0.0655, split temporel = 0.0650 — écart négligeable.
+    Le data leakage ne se manifeste donc **pas** dans ce cas précis. Explication :
+
+    - On n'utilise que **4 features résumées et lisses** (R/G/B moyens + road_offset). Le modèle
+      ne peut **pas mémoriser des frames individuelles** : deux frames voisines ont des features
+      presque identiques **mais aussi des cibles presque identiques**. La fonction à apprendre est
+      basse dimension et régulière → elle généralise aussi bien à une portion de circuit jamais vue.
+    - Les 3 épisodes se ressemblent (même circuit, même pilote rule-based), donc le test « inédit »
+      n'est pas si différent du train.
+
+    **Le principe reste correct** : le split par épisode est la bonne pratique. Son importance
+    **grandit avec la richesse des features** — avec des frames brutes (haute dimension) ou des
+    séquences (Phase 3), le modèle peut mémoriser des voisines et le leakage gonflerait nettement
+    les métriques. Ici, il se trouve simplement que le risque est faible.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
     ## Questions de réflexion — Phase 2
 
     **1. Le modèle bat-il la baseline ? Sur quelle action est-il le moins bon ?**
-    Le MLP améliore nettement la baseline sur le **steering** (la baseline « moyenne » ≈ 0 ne
-    sait pas tourner). Le gain est **plus faible sur gas/brake** : ces actions sont quasi
-    constantes dans les données (gas ~élevé, brake ~0), donc prédire la moyenne est déjà une
-    bonne approximation — il reste peu de marge à gagner. *(Reporte ici tes % de la cellule 16.)*
+    - **Steering** : RMSE 0.065 vs baseline 0.196 → **+66,8 %**. Net succès : la baseline « ≈ 0 »
+      ne sait pas tourner, le MLP oui.
+    - **Gas** : RMSE 0.063 vs 0.058 → **−8,9 %** (légèrement pire).
+    - **Brake** : 0.0108 vs 0.0107 → **−1 %** (égalité).
+
+    Le modèle est le moins bon sur **gas et brake**, mais c'est attendu : ces actions sont
+    **quasi constantes** dans les données, donc la moyenne est déjà une excellente prédiction et
+    il ne reste presque aucune variance à expliquer. Le MLP n'a de réelle valeur ajoutée que là
+    où il y a de la variabilité à modéliser : le **steering**.
 
     **2. Steering asymétrique (beaucoup de « tout droit ») — effet sur les métriques ?**
-    La majorité des steps sont des lignes droites (steering ≈ 0). La RMSE globale est donc
-    **dominée par cette classe facile** : un modèle qui prédit toujours ~0 obtient une RMSE
-    faible tout en ratant les virages. Solutions : **pondérer** les samples de virage dans la
-    loss, **sur-échantillonner** les virages, ou évaluer séparément la performance en virage.
+    La RMSE globale est **dominée par les lignes droites** (steering ≈ 0). Un modèle médiocre en
+    virage peut quand même afficher une RMSE faible. Solutions : **pondérer** les samples de
+    virage dans la loss, **sur-échantillonner** les virages, ou évaluer la RMSE **séparément en
+    virage vs ligne droite**.
 
     **3. RMSE vs précision directionnelle — cohérents ?**
-    Pas toujours. Un modèle peut avoir une **bonne RMSE** (bonne amplitude moyenne) mais une
-    **précision directionnelle médiocre** s'il se trompe parfois de **sens** sur les petits
-    virages. Pour un pilote, le **sens** prime sur l'amplitude : la précision directionnelle est
-    donc la métrique la plus parlante. *(Compare tes deux valeurs pour le steering et conclus.)*
+    Pour le steering, oui : RMSE faible (0.065) **et** précision directionnelle élevée (98,1 %) →
+    le modèle tourne dans le bon sens avec la bonne amplitude. **Attention** : la précision
+    directionnelle n'est **interprétable que pour le steering**. Pour le gas (toujours > 0 → 100 %
+    automatique) et le brake (≈ 0 → ~50 % de pur hasard), cette métrique n'a **aucun sens** et ne
+    doit pas être commentée.
 
-    **Pourquoi val < train ?** Le Dropout n'est actif qu'à l'entraînement (il dégrade la train
-    loss), et la 1ère moitié de l'épisode 2 (val) est plus régulière. Aucun signe de
-    surapprentissage.
+    **Learning rate.** Sur ce problème, `lr=1e-2` donne la meilleure val_loss (0.00191) **sans
+    instabilité**, devant `1e-3` (0.00283) et `1e-4` (0.00411, trop lent). Le risque d'instabilité
+    d'un grand lr ne se matérialise que sur des réseaux plus profonds — pas sur ce petit MLP.
+    """)
+    return
+
+
+@app.cell
+def _(dfs, mo, np):
+    def _autocorr(x, lag):
+        x = x - x.mean()
+        return float(np.sum(x[:-lag] * x[lag:]) / np.sum(x * x))
+
+    _steer = dfs[0]["action_steering"].to_numpy()
+    for _lag in (1, 5, 10):
+        print(f"Auto-corrélation steering (ep 0) à lag={_lag:2d} : {_autocorr(_steer, _lag):.3f}")
+
+    mo.md(r"""
+    ## Limite de la Phase 2 → Phase 3
+
+    Le `DrivingMLP` prédit chaque action **indépendamment** : il n'a aucune mémoire de ce qui
+    précède. Sur un virage qui s'accentue progressivement, il réagit **trop tard**.
+
+    L'auto-corrélation du steering ci-dessus (forte aux faibles lags) montre que le passé
+    récent **prédit** le présent → c'est exactement ce qu'un **LSTM** saura exploiter en
+    Phase 3 via des fenêtres glissantes de T pas de temps.
     """)
     return
 
