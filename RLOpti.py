@@ -32,7 +32,7 @@ def _():
 
 @app.cell
 def _(torch):
-    # Test multi-thread
+    # Utiliser tous les cœurs logiques (entraînement CPU)
     import os
 
     torch.set_num_threads(os.cpu_count())
@@ -51,9 +51,12 @@ def _(mo):
     observe la récompense, et apprend à estimer la **valeur** de chaque action.
 
     Briques clés :
-    - **MDP** : état (frame), action (5 discrètes), récompense, politique π.
+    - **MDP** : état (4 frames grises empilées), action (**9 actions discrètes** dont des
+      combinaisons frein+braquage), récompense, politique π.
     - **Q-Learning** : `Q(s,a)` = récompense attendue si on joue `a` en `s` puis qu'on joue bien.
-    - **Équation de Bellman** : `Q(s,a) ← r + γ · max_a' Q_target(s', a')` — la cible d'entraînement.
+    - **Équation de Bellman** : `Q(s,a) ← r + γ · Q_target(s', a*)` — la cible d'entraînement.
+    - **Double DQN** : la *policy* choisit l'action `a*`, la *target* l'évalue → réduit la
+      **surestimation** des Q-valeurs (cause classique de stagnation / oscillation du DQN).
     - **ε-greedy** : avec proba ε on explore (action aléatoire), sinon on exploite (meilleure Q).
     - **Experience replay** : on stocke les transitions et on ré-échantillonne → décorrèle les données.
     - **Target network** : un réseau figé pour calculer la cible → stabilise l'apprentissage.
@@ -62,78 +65,71 @@ def _(mo):
 
 
 @app.cell
-def _():
-    # def preprocess(obs):
-    #     """(96,96,3) RGB uint8 → (1,42,42) grayscale float [0,1]."""
-    #     gray = 0.299 * obs[..., 0] + 0.587 * obs[..., 1] + 0.114 * obs[..., 2]
-    #     img = Image.fromarray(gray.astype(np.uint8)).resize((42, 42), Image.BILINEAR)
-    #     return (np.asarray(img, dtype=np.float32) / 255.0)[None, :, :]  # (1,42,42)
-
-    # _env = gym.make("CarRacing-v2", continuous=False)
-    # print("Action space :", _env.action_space)  # Discrete(5)
-    # _obs, _ = _env.reset(seed=SEED)
-    # _state = preprocess(_obs)
-    # print("Obs brute :", _obs.shape, "→ état prétraité :", _state.shape)
-    # _env.close()
-
-    # fig_pre, _ax = plt.subplots(1, 2, figsize=(7, 3.5))
-    # _ax[0].imshow(_obs)
-    # _ax[0].set_title("obs RGB 96×96")
-    # _ax[0].axis("off")
-    # _ax[1].imshow(_state[0], cmap="gray")
-    # _ax[1].set_title("état 42×42 gris")
-    # _ax[1].axis("off")
-    # fig_pre.tight_layout()
-    # fig_pre
-    return
-
-
-@app.cell
 def _(Image, deque, gym, np):
     # 9 actions [steer, gas, brake] — dont des combinaisons frein+braquage
     ACTIONS = [
-        np.array([ 0.0, 0.0, 0.0], dtype=np.float32),  # 0 rien
+        np.array([0.0, 0.0, 0.0], dtype=np.float32),  # 0 rien
         np.array([-1.0, 0.0, 0.0], dtype=np.float32),  # 1 gauche
-        np.array([ 1.0, 0.0, 0.0], dtype=np.float32),  # 2 droite
-        np.array([ 0.0, 1.0, 0.0], dtype=np.float32),  # 3 gas
-        np.array([ 0.0, 0.0, 0.8], dtype=np.float32),  # 4 frein
+        np.array([1.0, 0.0, 0.0], dtype=np.float32),  # 2 droite
+        np.array([0.0, 1.0, 0.0], dtype=np.float32),  # 3 gas
+        np.array([0.0, 0.0, 0.8], dtype=np.float32),  # 4 frein
         np.array([-1.0, 0.0, 0.6], dtype=np.float32),  # 5 frein + gauche
-        np.array([ 1.0, 0.0, 0.6], dtype=np.float32),  # 6 frein + droite
+        np.array([1.0, 0.0, 0.6], dtype=np.float32),  # 6 frein + droite
         np.array([-0.6, 0.4, 0.0], dtype=np.float32),  # 7 gauche + gas
-        np.array([ 0.6, 0.4, 0.0], dtype=np.float32),  # 8 droite + gas
+        np.array([0.6, 0.4, 0.0], dtype=np.float32),  # 8 droite + gas
     ]
 
     def _to_gray42(obs):
         gray = 0.299 * obs[..., 0] + 0.587 * obs[..., 1] + 0.114 * obs[..., 2]
-        img  = Image.fromarray(gray.astype(np.uint8)).resize((42, 42), Image.BILINEAR)
-        return np.asarray(img, dtype=np.float32) / 255.0          # (42,42)
+        img = Image.fromarray(gray.astype(np.uint8)).resize((42, 42), Image.BILINEAR)
+        return np.asarray(img, dtype=np.float32) / 255.0  # (42,42)
 
     class CarRacingDQN(gym.Wrapper):
         """Actions combinées + frame skip + empilement de 4 frames + arrêt hors-piste."""
+
         def __init__(self, env, skip=3, intro=45, off_patience=50, n_stack=4):
             super().__init__(env)
-            self.skip, self.intro, self.off_patience, self.n_stack = skip, intro, off_patience, n_stack
+            self.skip, self.intro, self.off_patience, self.n_stack = (
+                skip,
+                intro,
+                off_patience,
+                n_stack,
+            )
             self.frames = deque(maxlen=n_stack)
             self.action_space = gym.spaces.Discrete(len(ACTIONS))
-            self.observation_space = gym.spaces.Box(0.0, 1.0, shape=(n_stack, 42, 42), dtype=np.float32)
+            self.observation_space = gym.spaces.Box(
+                0.0, 1.0, shape=(n_stack, 42, 42), dtype=np.float32
+            )
+
         def _state(self):
-            return np.stack(self.frames, axis=0)                  # (4,42,42)
+            return np.stack(self.frames, axis=0)  # (4,42,42)
+
         def reset(self, **kw):
             obs, info = self.env.reset(**kw)
             for _ in range(self.intro):
-                obs, _, _, _, info = self.env.step(np.array([0., 0., 0.], dtype=np.float32))
+                obs, _, _, _, info = self.env.step(
+                    np.array([0.0, 0.0, 0.0], dtype=np.float32)
+                )
             g = _to_gray42(obs)
             self.frames.clear()
             for _ in range(self.n_stack):
                 self.frames.append(g)
             self.neg = 0
             return self._state(), info
+
         def step(self, action_idx):
-            act, total, term, trunc, info = ACTIONS[int(action_idx)], 0.0, False, False, {}
+            act, total, term, trunc, info = (
+                ACTIONS[int(action_idx)],
+                0.0,
+                False,
+                False,
+                {},
+            )
             for _ in range(self.skip):
                 obs, r, term, trunc, info = self.env.step(act)
                 total += r
-                if term or trunc: break
+                if term or trunc:
+                    break
             self.frames.append(_to_gray42(obs))
             self.neg = self.neg + 1 if total < 0 else 0
             if self.neg >= self.off_patience:
@@ -149,22 +145,27 @@ def _(DEVICE, nn, torch):
         def __init__(self, n_actions=9):
             super().__init__()
             self.conv = nn.Sequential(
-                nn.Conv2d(4, 16, kernel_size=8, stride=4), nn.ReLU(),   # 4 frames empilées
-                nn.Conv2d(16, 32, kernel_size=4, stride=2), nn.ReLU(),
+                nn.Conv2d(4, 16, kernel_size=8, stride=4),
+                nn.ReLU(),  # 4 frames empilées
+                nn.Conv2d(16, 32, kernel_size=4, stride=2),
+                nn.ReLU(),
             )
             self.fc = nn.Sequential(
                 nn.Flatten(),
-                nn.Linear(32 * 3 * 3, 256), nn.ReLU(),
+                nn.Linear(32 * 3 * 3, 256),
+                nn.ReLU(),
                 nn.Linear(256, n_actions),
             )
+
         def forward(self, x):
             return self.fc(self.conv(x))
 
+    # Vérification des dimensions — ne pas modifier
     _net = DQN().to(DEVICE)
-    _dummy = torch.zeros(8, 4, 42, 42).to(DEVICE)        # ← 4 canaux (frames empilées)
+    _dummy = torch.zeros(8, 4, 42, 42).to(DEVICE)  # 4 canaux (frames empilées)
     with torch.no_grad():
         _q = _net(_dummy)
-    print(f"Entrée {tuple(_dummy.shape)} → Q-valeurs {tuple(_q.shape)}")   # (8, 9)
+    print(f"Entrée {tuple(_dummy.shape)} → Q-valeurs {tuple(_q.shape)}")  # (8, 9)
     assert _q.shape == (8, 9), "Dimensions incorrectes !"
     print(f"Paramètres : {sum(p.numel() for p in _net.parameters()):,}")
     return (DQN,)
@@ -175,13 +176,23 @@ def _(deque, np, random):
     class ReplayBuffer:
         def __init__(self, capacity=60_000):
             self.buf = deque(maxlen=capacity)
+
         def push(self, s, a, r, s2, done):
-            self.buf.append(((s * 255).astype(np.uint8), a, r, (s2 * 255).astype(np.uint8), done))
+            # stockage en uint8 pour diviser la RAM par 4
+            self.buf.append(
+                ((s * 255).astype(np.uint8), a, r, (s2 * 255).astype(np.uint8), done)
+            )
+
         def sample(self, batch_size):
             s, a, r, s2, d = zip(*random.sample(self.buf, batch_size))
-            return (np.stack(s).astype(np.float32) / 255., np.array(a),
-                    np.array(r, dtype=np.float32),
-                    np.stack(s2).astype(np.float32) / 255., np.array(d, dtype=np.float32))
+            return (
+                np.stack(s).astype(np.float32) / 255.0,
+                np.array(a),
+                np.array(r, dtype=np.float32),
+                np.stack(s2).astype(np.float32) / 255.0,
+                np.array(d, dtype=np.float32),
+            )
+
         def __len__(self):
             return len(self.buf)
 
@@ -193,14 +204,14 @@ def _(DEVICE, DQN, F, ReplayBuffer, nn, random, torch):
     class DQNAgent:
         def __init__(
             self,
-            n_actions=5,
+            n_actions=9,  # ← défaut aligné sur len(ACTIONS)
             gamma=0.95,
             lr=1e-4,
             device=DEVICE,
             eps_start=1.0,
             eps_end=0.05,
             eps_decay=0.995,
-            buffer_cap=50_000,
+            buffer_cap=60_000,
         ):
             self.n_actions, self.gamma, self.device = n_actions, gamma, device
             self.policy_net = DQN(n_actions).to(device)
@@ -233,8 +244,12 @@ def _(DEVICE, DQN, F, ReplayBuffer, nn, random, torch):
 
             q = self.policy_net(s).gather(1, a)  # Q(s,a) prédit
             with torch.no_grad():
-                q_next = self.target_net(s2).max(1, keepdim=True)[0]
-                target = r + self.gamma * q_next * (1 - d)  # ← équation de Bellman
+                # --- Double DQN ---
+                # La POLICY choisit la meilleure action en s', la TARGET l'évalue.
+                # Découpler sélection et évaluation réduit la surestimation des Q-valeurs.
+                next_actions = self.policy_net(s2).argmax(1, keepdim=True)
+                q_next = self.target_net(s2).gather(1, next_actions)
+                target = r + self.gamma * q_next * (1 - d)  # équation de Bellman
             loss = F.smooth_l1_loss(q, target)  # Huber Loss
             self.opt.zero_grad()
             loss.backward()
@@ -252,25 +267,6 @@ def _(DEVICE, DQN, F, ReplayBuffer, nn, random, torch):
 
 
 @app.cell
-def _():
-    # _agent = DQNAgent()
-    # _env = gym.make("CarRacing-v2", continuous=False)
-    # _obs, _ = _env.reset(seed=SEED)
-    # _st = preprocess(_obs)
-
-    # _a = _agent.select_action(_st)  # ← méthode single-state (pas batched)
-    # _obs2, _r, _term, _trunc, _ = _env.step(_a)
-    # _agent.store(_st, _a, _r, preprocess(_obs2), float(_term or _trunc))
-    # _env.close()
-
-    # print(
-    #     f"Action choisie : {_a}  | reward : {_r:.2f}  | buffer : {len(_agent.buffer)}"
-    # )
-    # print("train_step (buffer trop petit) :", _agent.train_step())  # None attendu
-    return
-
-
-@app.cell
 def _(np, torch):
     def select_actions_batched(agent, states, eps):
         n = len(states)
@@ -285,46 +281,33 @@ def _(np, torch):
 
 
 @app.cell
-def _():
-    # class CarRacingWrapper(gym.Wrapper):
-    #     """Saute le zoom d'intro, répète chaque action (frame skip), et termine
-    #     l'épisode quand la voiture reste hors-piste trop longtemps."""
-
-    #     def __init__(self, env, skip=4, intro=45, off_patience=50):
-    #         super().__init__(env)
-    #         self.skip, self.intro, self.off_patience = skip, intro, off_patience
-
-    #     def reset(self, **kw):
-    #         obs, info = self.env.reset(**kw)
-    #         for _ in range(self.intro):
-    #             obs, _, _, _, info = self.env.step(0)  # sauter le zoom
-    #         self.neg = 0
-    #         return obs, info
-
-    #     def step(self, action):
-    #         total, term, trunc, info = 0.0, False, False, {}
-    #         for _ in range(self.skip):  # répéter l'action
-    #             obs, r, term, trunc, info = self.env.step(action)
-    #             total += r
-    #             if term or trunc:
-    #                 break
-    #         self.neg = self.neg + 1 if total < 0 else 0  # reward négatif = hors-piste
-    #         if self.neg >= self.off_patience:
-    #             term = True
-    #         return obs, total, term, trunc, info
-    return
-
-
-@app.cell
 def _(SEED, np, plt, select_actions_batched):
-    def train_dqn_vec(agent, envs, total_steps=300_000, target_every=2000,
-                      batch_size=64, eps_end=0.05, explore_frac=0.5, verbose=True):
+    def train_dqn_vec(
+        agent,
+        envs,
+        total_steps=300_000,
+        target_every=2000,
+        batch_size=64,
+        eps_end=0.05,
+        explore_frac=0.5,
+        learning_starts=5000,
+        grad_steps=1,
+        verbose=True,
+    ):
+        """
+        Entraînement DQN vectorisé (plusieurs envs en parallèle).
+        - learning_starts : on remplit d'abord le buffer avant d'apprendre (buffer varié).
+        - grad_steps      : nb de gradient steps par itération (monte le replay ratio).
+                            Attention : grad_steps=2 ~ double le coût CPU par itération.
+        Restaure le MEILLEUR snapshot (reward moy. sur 20 ép.) en fin d'entraînement.
+        """
         import copy
+
         obs, _ = envs.reset(seed=SEED)
         states = obs.astype(np.float32)
         n_envs = envs.num_envs
         ep_r, completed, gstep, last_target = np.zeros(n_envs), [], 0, 0
-        best_ma, best_state = -1e9, None                      # ← suivi du meilleur
+        best_ma, best_state = -1e9, None
 
         while gstep < total_steps:
             agent.eps = max(eps_end, 1.0 - gstep / (explore_frac * total_steps))
@@ -333,26 +316,40 @@ def _(SEED, np, plt, select_actions_batched):
             nstates = obs.astype(np.float32)
             done = np.logical_or(term, trunc)
             for i in range(n_envs):
-                agent.store(states[i], int(actions[i]), float(r[i]), nstates[i], float(done[i]))
+                agent.store(
+                    states[i], int(actions[i]), float(r[i]), nstates[i], float(done[i])
+                )
             states = nstates
-            ep_r += r; gstep += n_envs
-            agent.train_step(batch_size)
+            ep_r += r
+            gstep += n_envs
+
+            if len(agent.buffer) >= learning_starts:  # warmup terminé → on apprend
+                for _ in range(grad_steps):
+                    agent.train_step(batch_size)
+
             if gstep - last_target >= target_every:
-                agent.update_target(); last_target = gstep
+                agent.update_target()
+                last_target = gstep
             for i in range(n_envs):
                 if done[i]:
-                    completed.append(ep_r[i]); ep_r[i] = 0.0
+                    completed.append(ep_r[i])
+                    ep_r[i] = 0.0
 
-            if len(completed) >= 20:                          # ← snapshot du meilleur
+            if len(completed) >= 20:  # snapshot du meilleur
                 _ma = np.mean(completed[-20:])
                 if _ma > best_ma:
-                    best_ma, best_state = _ma, copy.deepcopy(agent.policy_net.state_dict())
+                    best_ma, best_state = (
+                        _ma,
+                        copy.deepcopy(agent.policy_net.state_dict()),
+                    )
 
             if verbose and len(completed) and gstep % (n_envs * 200) < n_envs:
-                print(f"steps={gstep:6d} | épisodes={len(completed):4d} "
-                      f"| reward moy(20)={np.mean(completed[-20:]):7.1f} | ε={agent.eps:.3f}")
+                print(
+                    f"steps={gstep:6d} | épisodes={len(completed):4d} "
+                    f"| reward moy(20)={np.mean(completed[-20:]):7.1f} | ε={agent.eps:.3f}"
+                )
 
-        if best_state is not None:                            # ← on restaure le meilleur
+        if best_state is not None:  # on restaure le meilleur
             agent.policy_net.load_state_dict(best_state)
             print(f"Meilleur reward moy(20) = {best_ma:.1f} — modèle restauré.")
         return completed
@@ -369,7 +366,11 @@ def _(SEED, np, plt, select_actions_batched):
                 color="orange",
                 label=f"moyenne mobile ({window})",
             )
-        ax.set(xlabel="Épisode", ylabel="Récompense", title="Apprentissage DQN")
+        ax.set(
+            xlabel="Épisode",
+            ylabel="Récompense",
+            title="Apprentissage DQN (Double DQN)",
+        )
         ax.legend()
         ax.grid(alpha=0.3)
         fig.tight_layout()
@@ -400,27 +401,26 @@ def _(
     train_button,
     train_dqn_vec,
 ):
-    mo.stop(not train_button.value, mo.md("*Clique pour l'entraînement v2 (long : 30-60 min CPU).*"))
+    mo.stop(
+        not train_button.value,
+        mo.md("*Clique pour l'entraînement (long : 30-60 min CPU).*"),
+    )
 
     N_ENVS = min(os.cpu_count(), 8)
+
     def _make_env():
-        return CarRacingDQN(gym.make("CarRacing-v2", continuous=True))   # continuous=True !
+        return CarRacingDQN(
+            gym.make("CarRacing-v2", continuous=True)
+        )  # continuous=True !
 
     envs = gym.vector.AsyncVectorEnv([_make_env for _ in range(N_ENVS)])
-    torch.manual_seed(SEED); random.seed(SEED)
-    agent   = DQNAgent(n_actions=len(ACTIONS), gamma=0.99, lr=1e-4, buffer_cap=60_000)
+    torch.manual_seed(SEED)
+    random.seed(SEED)
+    agent = DQNAgent(n_actions=len(ACTIONS), gamma=0.99, lr=1e-4, buffer_cap=60_000)
     rewards = train_dqn_vec(agent, envs, total_steps=300_000)
     envs.close()
     plot_rewards(rewards, window=20)
     return agent, rewards
-
-
-@app.cell
-def _(agent, torch):
-    # Sauvegarder uniquement le modèle (policy_net)
-    torch.save(agent.policy_net.state_dict(), "dqn_model_v2_entraine.pth")
-    print("Modèle sauvegardé sous 'dqn_model_entraine.pth'.")
-    return
 
 
 @app.cell
@@ -464,14 +464,18 @@ def _(mo):
 
 
 @app.cell
-def _(SEED, agent, gym, mo, plt, preprocess, torch, watch_button):
-    mo.stop(not watch_button.value, mo.md("*Entraîne d'abord l'agent (cellule 9).*"))
+def _(CarRacingDQN, agent, gym, mo, plt, torch, watch_button):
+    mo.stop(
+        not watch_button.value, mo.md("*Entraîne d'abord l'agent (bouton ci-dessus).*")
+    )
 
-    _env = gym.make("CarRacing-v2", continuous=False)
-    _obs, _ = _env.reset(seed=SEED + 999)
-    for _ in range(45):
-        _obs, *_ = _env.step(0)
-    _state = preprocess(_obs)
+    # On utilise le wrapper v2 : l'état est déjà (4,42,42), pas de `preprocess`.
+    # render_mode="rgb_array" permet de récupérer les frames RGB pour l'affichage.
+    _env = CarRacingDQN(
+        gym.make("CarRacing-v2", continuous=True, render_mode="rgb_array")
+    )
+    _obs, _ = _env.reset()
+    _state = _obs
 
     _eps_save = agent.eps
     agent.eps = 0.0  # exploitation pure (ε=0)
@@ -480,16 +484,16 @@ def _(SEED, agent, gym, mo, plt, preprocess, torch, watch_button):
         for _t in range(1000):
             _a = agent.select_action(_state)
             _obs, _r, _term, _trunc, _ = _env.step(_a)
-            _state = preprocess(_obs)
+            _state = _obs
             _total += _r
             if _t % 30 == 0:
-                _frames.append(_obs.copy())
+                _frames.append(_env.render())  # frame RGB courante
             if _term or _trunc:
                 break
     agent.eps = _eps_save
     _env.close()
 
-    print(f"Récompense totale (politique gloutonne) : {_total:.1f}")
+    print(f"Récompense totale (politique gloutonne) : {_total:.1f}  ({_t + 1} steps)")
     fig_w, _axes = plt.subplots(2, 5, figsize=(14, 6))
     for _ax, _f in zip(_axes.ravel(), _frames):
         _ax.imshow(_f)
@@ -513,35 +517,46 @@ def _(mo):
 
 @app.cell
 def _(
+    ACTIONS,
+    CarRacingDQN,
     DQNAgent,
     SEED,
     gamma_button,
     gym,
     mo,
     np,
+    os,
     plt,
     random,
     torch,
-    train_dqn,
+    train_dqn_vec,
 ):
     mo.stop(
         not gamma_button.value,
-        mo.md("*Clique pour 3 entraînements (25 ép. chacun) — compte un bon moment.*"),
+        mo.md(
+            "*Clique pour 3 entraînements vectorisés réduits (80k steps chacun) — long.*"
+        ),
     )
+
+    _n_envs = min(os.cpu_count(), 8)
+
+    def _make_env():
+        return CarRacingDQN(gym.make("CarRacing-v2", continuous=True))
 
     rewards_by_gamma = {}
     fig_g, ax_g = plt.subplots(figsize=(8, 4))
     for _g in [0.90, 0.95, 0.99]:
         torch.manual_seed(SEED)
         random.seed(SEED)
-        _ag = DQNAgent(gamma=_g)
-        _env = gym.make("CarRacing-v2", continuous=False)
-        _rw = train_dqn(_ag, _env, n_episodes=25, verbose=False)
-        _env.close()
+        _envs = gym.vector.AsyncVectorEnv([_make_env for _ in range(_n_envs)])
+        _ag = DQNAgent(n_actions=len(ACTIONS), gamma=_g, lr=1e-4, buffer_cap=60_000)
+        _rw = train_dqn_vec(_ag, _envs, total_steps=80_000, verbose=False)
+        _envs.close()
         rewards_by_gamma[_g] = _rw
         _w = 5
-        _ma = np.convolve(_rw, np.ones(_w) / _w, mode="valid")
-        ax_g.plot(range(_w - 1, len(_rw)), _ma, label=f"γ={_g}")
+        if len(_rw) >= _w:
+            _ma = np.convolve(_rw, np.ones(_w) / _w, mode="valid")
+            ax_g.plot(range(_w - 1, len(_rw)), _ma, label=f"γ={_g}")
         print(f"γ={_g} → reward moyen (10 derniers ép.) = {np.mean(_rw[-10:]):.1f}")
 
     ax_g.set(xlabel="Épisode", ylabel="Récompense (moy. mobile)", title="Impact de γ")
@@ -554,34 +569,45 @@ def _(
 
 @app.cell
 def _(mo):
-    play_button = mo.ui.run_button(
-        label="▶ Regarder l'agent conduire (politique gloutonne)"
-    )
+    play_button = mo.ui.run_button(label="▶ Regarder l'agent conduire (fenêtre live)")
     play_button
     return (play_button,)
 
 
 @app.cell
-def _(CarRacingDQN, SEED, agent, gym, mo, play_button, torch):
+def _(CarRacingDQN, agent, gym, mo, play_button, torch):
     mo.stop(not play_button.value, mo.md("*Entraîne (ou recharge) l'agent d'abord.*"))
     from collections import Counter
 
     _env = CarRacingDQN(gym.make("CarRacing-v2", continuous=True, render_mode="human"))
-    _obs, _ = _env.reset(seed=SEED + 1234)
+    _obs, _ = _env.reset()
     _state = _obs
-    _eps_save = agent.eps; agent.eps = 0.0
+    _eps_save = agent.eps
+    agent.eps = 0.0
     _total, _acts, _t = 0.0, [], 0
     with torch.no_grad():
         for _t in range(800):
             _a = agent.select_action(_state)
             _acts.append(int(_a))
             _obs, _r, _term, _trunc, _ = _env.step(_a)
-            _state = _obs; _total += _r
-            if _term or _trunc: break
-    agent.eps = _eps_save; _env.close()
+            _state = _obs
+            _total += _r
+            if _term or _trunc:
+                break
+    agent.eps = _eps_save
+    _env.close()
 
-    _names = {0:"rien",1:"gauche",2:"droite",3:"gas",4:"frein",
-              5:"frein+G",6:"frein+D",7:"gauche+gas",8:"droite+gas"}
+    _names = {
+        0: "rien",
+        1: "gauche",
+        2: "droite",
+        3: "gas",
+        4: "frein",
+        5: "frein+G",
+        6: "frein+D",
+        7: "gauche+gas",
+        8: "droite+gas",
+    }
     _repart = {_names[k]: v for k, v in sorted(Counter(_acts).items())}
     print(f"Récompense totale : {_total:.1f}  ({_t + 1} steps)")
     print("Répartition des actions :", _repart)
@@ -597,31 +623,41 @@ def _(mo):
 
 @app.cell
 def _(CarRacingDQN, SEED, agent, gym, mo, os, record_button, torch):
-    mo.stop(not record_button.value, mo.md("*Enregistre un mp4 dans ./videos (`uv add moviepy`).*"))
+    mo.stop(
+        not record_button.value,
+        mo.md("*Enregistre un mp4 dans ./videos (`pip install moviepy`).*"),
+    )
     from gymnasium.wrappers import RecordVideo
+
     os.makedirs("videos", exist_ok=True)
-    _rec = RecordVideo(gym.make("CarRacing-v2", continuous=True, render_mode="rgb_array"),
-                       video_folder="videos", name_prefix="dqn_v2", episode_trigger=lambda e: True)
+    _rec = RecordVideo(
+        gym.make("CarRacing-v2", continuous=True, render_mode="rgb_array"),
+        video_folder="videos",
+        name_prefix="dqn_v2",
+        episode_trigger=lambda e: True,
+    )
     _env = CarRacingDQN(_rec)
-    _obs, _ = _env.reset(seed=SEED + 1234); _state = _obs
-    _eps_save = agent.eps; agent.eps = 0.0
+    _obs, _ = _env.reset(seed=SEED + 1234)
+    _state = _obs
+    _eps_save = agent.eps
+    agent.eps = 0.0
     _total, _t = 0.0, 0
     with torch.no_grad():
         for _t in range(800):
             _a = agent.select_action(_state)
             _obs, _r, _term, _trunc, _ = _env.step(_a)
-            _state = _obs; _total += _r
-            if _term or _trunc: break
-    agent.eps = _eps_save; _env.close()
+            _state = _obs
+            _total += _r
+            if _term or _trunc:
+                break
+    agent.eps = _eps_save
+    _env.close()
 
     _files = sorted(f for f in os.listdir("videos") if f.endswith(".mp4"))
     print(f"Vidéo écrite — reward {_total:.1f}  ({_t + 1} steps)")
-    mo.video(src=os.path.join("videos", _files[-1])) if _files else mo.md("Aucun mp4 trouvé.")
-    return
-
-
-@app.cell
-def _():
+    mo.video(src=os.path.join("videos", _files[-1])) if _files else mo.md(
+        "Aucun mp4 trouvé."
+    )
     return
 
 

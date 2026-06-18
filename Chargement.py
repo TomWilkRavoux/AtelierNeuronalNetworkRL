@@ -27,7 +27,7 @@ def _():
     print(
         f"gymnasium {gym.__version__} | torch {torch.__version__} | device : {DEVICE}"
     )
-    return DEVICE, F, deque, gym, mo, nn, np, plt, random, torch
+    return DEVICE, F, Image, SEED, deque, gym, mo, nn, np, plt, random, torch
 
 
 @app.cell
@@ -198,8 +198,30 @@ def _(mo):
 
 
 @app.cell
-def _():
-    return
+def _(Image, SEED, gym, np, plt):
+    def preprocess(obs):
+        """(96,96,3) RGB uint8 → (1,42,42) grayscale float [0,1]."""
+        gray = 0.299 * obs[..., 0] + 0.587 * obs[..., 1] + 0.114 * obs[..., 2]
+        img = Image.fromarray(gray.astype(np.uint8)).resize((42, 42), Image.BILINEAR)
+        return (np.asarray(img, dtype=np.float32) / 255.0)[None, :, :]  # (1,42,42)
+
+    _env = gym.make("CarRacing-v2", continuous=False)
+    print("Action space :", _env.action_space)  # Discrete(5)
+    _obs, _ = _env.reset(seed=SEED)
+    _state = preprocess(_obs)
+    print("Obs brute :", _obs.shape, "→ état prétraité :", _state.shape)
+    _env.close()
+
+    fig_pre, _ax = plt.subplots(1, 2, figsize=(7, 3.5))
+    _ax[0].imshow(_obs)
+    _ax[0].set_title("obs RGB 96×96")
+    _ax[0].axis("off")
+    _ax[1].imshow(_state[0], cmap="gray")
+    _ax[1].set_title("état 42×42 gris")
+    _ax[1].axis("off")
+    fig_pre.tight_layout()
+    fig_pre
+    return (preprocess,)
 
 
 @app.cell
