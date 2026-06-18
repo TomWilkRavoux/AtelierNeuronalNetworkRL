@@ -2,3 +2,6 @@
 __marimo__/
 *.onnx
 lib/
+models/
+*.pth
+videos/

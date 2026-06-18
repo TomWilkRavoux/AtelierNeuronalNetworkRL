@@ -11,6 +11,7 @@ dependencies = [
     "marimo>=0.23.9",
     "matplotlib==3.8.3",
     "ml-dtypes>=0.5.3",
+    "moviepy>=2.2.1",
     "netron>=9.1.1",
     "numpy==1.26.4",
     "onnx<1.18",
